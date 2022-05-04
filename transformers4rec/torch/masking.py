@@ -769,3 +769,102 @@ class ReplacementLanguageModeling(MaskedLanguageModeling):
         s = logits + gumbel_noise
 
         return torch.argmax(torch.nn.functional.softmax(s, dim=-1), -1)
+
+
+@masking_registry.register_with_multiple_names("mlm_last", "masked_last")
+@docstring_parameter(mask_sequence_parameters=MASK_SEQUENCE_PARAMETERS_DOCSTRING)
+class MaskedLanguageWithLastModeling(MaskedLanguageModeling):
+    """
+    Use Masked Language Modeling (mlm) with always masking the last item
+    Parameters
+    ----------
+    {mask_sequence_parameters}
+    mlm_probability: Optional[float], default = 0.15
+        Probability of an item to be selected (masked) as a label of the given sequence.
+        p.s. We enforce that at least one item is masked for each sequence, so that the network can
+        learn something with it.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        padding_idx: int = 0,
+        eval_on_last_item_seq_only: bool = True,
+        mlm_probability: float = 0.15,
+        **kwargs
+    ):
+        super(MaskedLanguageWithLastModeling, self).__init__(
+            hidden_size=hidden_size,
+            padding_idx=padding_idx,
+            eval_on_last_item_seq_only=eval_on_last_item_seq_only,
+            kwargs=kwargs,
+        )
+        self.mlm_probability = mlm_probability
+
+    def _compute_masked_targets(self, item_ids: torch.Tensor, training=False) -> MaskingInfo:
+        """
+        Prepare sequence with mask schema for masked language modeling prediction
+        the function is based on HuggingFace's transformers/data/data_collator.py
+
+        Parameters
+        ----------
+        item_ids: torch.Tensor
+            Sequence of input itemid (target) column
+
+        Returns
+        -------
+        labels: torch.Tensor
+            Sequence of masked item ids.
+        mask_labels: torch.Tensor
+            Masking schema for masked targets positions.
+        """
+
+        labels = torch.full(
+            item_ids.shape, self.padding_idx, dtype=item_ids.dtype, device=item_ids.device
+        )
+        non_padded_mask = item_ids != self.padding_idx
+
+        rows_ids = torch.arange(item_ids.size(0), dtype=torch.long, device=item_ids.device)
+        # During training, masks labels to be predicted according to a probability, ensuring that
+        #   each session has at least one label to predict
+        if training:
+            # Selects a percentage of items to be masked (selected as labels)
+            probability_matrix = torch.full(
+                item_ids.shape, self.mlm_probability, device=item_ids.device
+            )
+            mask_labels = torch.bernoulli(probability_matrix).bool() & non_padded_mask
+            labels = torch.where(
+                mask_labels,
+                item_ids,
+                torch.full_like(item_ids, self.padding_idx),
+            )
+
+            # Always mask last item (purchase)
+            last_item_sessions = non_padded_mask.sum(dim=1) - 1
+            labels[rows_ids, last_item_sessions] = item_ids[rows_ids, last_item_sessions]
+            mask_labels = labels != self.padding_idx
+
+            # If a sequence has only masked labels, unmasks one of the labels
+            sequences_with_only_labels = mask_labels.sum(dim=1) == non_padded_mask.sum(dim=1)
+            sampled_labels_to_unmask = torch.multinomial(
+                mask_labels.float(), num_samples=1
+            ).squeeze()
+
+            labels_to_unmask = torch.masked_select(
+                sampled_labels_to_unmask, sequences_with_only_labels
+            )
+            rows_to_unmask = torch.masked_select(rows_ids, sequences_with_only_labels)
+
+            labels[rows_to_unmask, labels_to_unmask] = self.padding_idx
+            mask_labels = labels != self.padding_idx
+
+        else:
+            if self.eval_on_last_item_seq_only:
+                last_item_sessions = non_padded_mask.sum(dim=1) - 1
+                labels[rows_ids, last_item_sessions] = item_ids[rows_ids, last_item_sessions]
+                mask_labels = labels != self.padding_idx
+            else:
+                masking_info = self.predict_all(item_ids)
+                mask_labels, labels = masking_info.schema, masking_info.targets
+
+        return MaskingInfo(mask_labels, labels)
